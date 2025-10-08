@@ -1,0 +1,38 @@
+{
+    "supplier_invoice_date": "DD-MM-YYYY format",
+    "supplier_invoice_no": "invoice number",
+    "supplier_name": "company name",
+    "supplier_gstn": "GST number",
+    "supplier_address": "full address",
+    "recipient_name": "buyer company name",
+    "recipient_gstn": "buyer GST number",
+    "recipient_address": "buyer full address",
+    "items": [
+        {
+            "sr_number": "serial number",
+            "item_name": "product name/description",
+            "hsn_code": "HSN/SAC code",
+            "part_number": "part number if available",
+            "uom": "unit of measurement (Nos, Mtrs, Kg, etc)",
+            "quantity": "numeric quantity",
+            "item_rate": "rate per unit",
+            "discount_amount": "discount if any",
+            "discount_percentage": "discount % if any",
+            "amount": "line item total amount",
+            "sgst_rate": "SGST rate %",
+            "sgst_amount": "SGST amount",
+            "cgst_rate": "CGST rate %",
+            "cgst_amount": "CGST amount",
+            "igst_rate": "IGST rate %",
+            "igst_amount": "IGST amount"
+        }
+    ],
+    "totals": {
+        "subtotal": "subtotal before tax",
+        "total_cgst": "total CGST amount",
+        "total_sgst": "total SGST amount",
+        "total_igst": "total IGST amount",
+        "total_tax": "total tax amount",
+        "grand_total": "final total amount"
+    }
+}
