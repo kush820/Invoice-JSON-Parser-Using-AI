@@ -74,8 +74,3 @@ Troubleshooting
 - Missing dependencies: re-run `pip install -r requirements.txt` and inspect the error messages.
 - Authentication errors: verify key values in `api_keys.py` or your environment variables.
 - If you want the project to use environment variables instead of `api_keys.py`, I can provide a small patch to read keys from `os.environ`.
-
-License
--------
-
-MIT
