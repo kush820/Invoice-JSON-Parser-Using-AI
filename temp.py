@@ -1,13 +1,11 @@
 import os
-import uuid
 import fitz  # PyMuPDF
 import cv2
 import numpy as np
 import json
-# import google.generativeai as genai
 from mistralai import Mistral
-from api_keys import mistral_api_key
-from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify, send_file
 from werkzeug.utils import secure_filename
 from PIL import Image
 import pytesseract
@@ -15,12 +13,13 @@ import re
 
 app = Flask(__name__)
 UPLOAD_FOLDER = "uploads"
+OUTPUT_FOLDER = "outputs"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+load_dotenv()
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-BLOCKS_FOLDER = "extracted_blocks"
-os.makedirs(BLOCKS_FOLDER, exist_ok=True)
-client = Mistral(api_key=mistral_api_key)
+client = Mistral(api_key=os.getenv("mistral_api_key"))
 
 
 def preprocess_page(page):
@@ -32,26 +31,20 @@ def preprocess_page(page):
 
 
 def clean_json_output(raw_output):
+    """Clean LLM output and parse as JSON while preserving structure."""
     if not raw_output:
         return {}
 
-    # Remove code fences
+    # Remove code fences and extra escapes
     raw_output = re.sub(r"^```[a-zA-Z]*\n?|```$", "", raw_output.strip())
-
-    # Remove leading/trailing whitespace
-    raw_output = raw_output.strip()
-
-    # Replace escaped quotes and newlines
-    raw_output = raw_output.replace('\\"', '').replace('\n', ' ').replace('\r', ' ')
-
+    raw_output = raw_output.strip().replace('\\"', '').replace('\r', ' ')
     try:
         return json.loads(raw_output)
     except json.JSONDecodeError:
-        # As last resort, return raw string
         return {"raw_output": raw_output}
 
 
-@app.route('/extract-blocks', methods=['POST'])
+@app.route('/invoice2json', methods=['POST'])
 def extract_blocks():
     if 'file' not in request.files:
         return jsonify({'error': 'No file provided'}), 400
@@ -60,17 +53,21 @@ def extract_blocks():
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
 
+    # Check if the client wants a downloadable file
+    toSave = request.form.get('save', 'true').lower() == 'true'
+
     filename = secure_filename(file.filename)
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(filepath)
 
     ext = os.path.splitext(filename)[1].lower()
-    cropped_images = []
     structured_text = {}
-    full_text_list = []
 
     def process_image_blocks(np_img, page_num):
-        data = pytesseract.image_to_data(cv2.cvtColor(np_img, cv2.COLOR_BGR2GRAY), output_type=pytesseract.Output.DICT)
+        data = pytesseract.image_to_data(
+            cv2.cvtColor(np_img, cv2.COLOR_BGR2GRAY),
+            output_type=pytesseract.Output.DICT
+        )
         page_dict = {}
         n_boxes = len(data['level'])
         for i in range(n_boxes):
@@ -79,32 +76,18 @@ def extract_blocks():
             line_num = data['line_num'][i]
             left, top, width, height = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
             text = data['text'][i].strip()
+
             if not text:
                 continue
 
-            # Initialize hierarchy: block -> paragraph -> line
             page_dict.setdefault(f'block_{block_num}', {'coords': [], 'paragraphs': {}})
             block = page_dict[f'block_{block_num}']
-
             block['coords'].append((left, top, width, height))
             block['paragraphs'].setdefault(f'para_{par_num}', {})
             block['paragraphs'][f'para_{par_num}'].setdefault(f'line_{line_num}', [])
             block['paragraphs'][f'para_{par_num}'][f'line_{line_num}'].append(text)
-            full_text_list.append(text)
 
-        # Crop images and prepare structured text
         for block_key, block in page_dict.items():
-            coords = block['coords']
-            x_min = min(c[0] for c in coords)
-            y_min = min(c[1] for c in coords)
-            x_max = max(c[0]+c[2] for c in coords)
-            y_max = max(c[1]+c[3] for c in coords)
-            crop_img = np_img[y_min:y_max, x_min:x_max]
-            crop_filename = f"{uuid.uuid4()}.png"
-            crop_path = os.path.join(BLOCKS_FOLDER, crop_filename)
-            cv2.imwrite(crop_path, crop_img)
-            cropped_images.append(crop_filename)
-
             structured_paragraphs = {}
             for para_key, lines in block['paragraphs'].items():
                 paragraph_text = ' '.join([' '.join(lines[line]) for line in sorted(lines.keys())])
@@ -117,8 +100,13 @@ def extract_blocks():
             doc = fitz.open(filepath)
             for page_num in range(len(doc)):
                 page = doc.load_page(page_num)
-                np_img = preprocess_page(page)
-                process_image_blocks(np_img, page_num)
+                text = page.get_text("text").strip()
+
+                if text:
+                    structured_text[f"page_{page_num}"] = {"text": text}
+                else:
+                    np_img = preprocess_page(page)
+                    process_image_blocks(np_img, page_num)
             doc.close()
         else:
             img = Image.open(filepath).convert("RGB")
@@ -127,10 +115,7 @@ def extract_blocks():
     finally:
         os.remove(filepath)
 
-    full_text = "\n".join(full_text_list)
-    # return jsonify({'structured_text': structured_text, 'full_text': full_text})
-
-    # --- Gemini LLM processing ---
+    # --- LLM Processing ---
     try:
         with open("op_schema.json", "r") as f:
             schema = json.load(f)
@@ -146,38 +131,37 @@ def extract_blocks():
         3. Do NOT add any comments or formatting. 
         4. The JSON must be compact and directly parsable with json.loads() in Python. 
         5. Clean the data: remove typos, extra spaces, newlines, or escape characters where possible. 
-        6. Ensure all keys and values strictly follow the schema. If a value is missing, set it to null (not empty or "").
+        6. Ensure all keys and values strictly follow the schema. If a value is missing, set it to null.
         """
-
-        llm_input = json.dumps(structured_text, ensure_ascii=False)
 
         response = client.chat.complete(
             model="mistral-small-latest",
             messages=[
-                {
-                    "role": "system",
-                    "content": sys_prompt
-                },
-                {
-                    "role": "user",
-                    "content": f"Invoice Text:\n{llm_input}"
-                }
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": f"Invoice Text:\n{json.dumps(structured_text, ensure_ascii=False)}"}
             ]
         )
 
-        # Mistral returns JSON object directly
         llm_output = response.choices[0].message.content
-
-        # Remove Markdown code block if present
         structured_json = clean_json_output(llm_output)
-        print(type(structured_json))
         json_res = json.dumps(structured_json, indent=2)
-        print(json_res)
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-    return app.response_class(json_res, mimetype="application/json")
+    result = {"structured_json": json_res}
+
+    # --- Save JSON file if requested ---
+    if toSave:
+        output_filename = os.path.splitext(filename)[0] + ".json"
+        output_path = os.path.join(OUTPUT_FOLDER, output_filename)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(llm_output)  # save exact LLM output to preserve key order
+
+        result["download_file"] = output_path  # return path for Streamlit download
+
+    return jsonify(result)
+
 
 if __name__ == "__main__":
     app.run(debug=True)
