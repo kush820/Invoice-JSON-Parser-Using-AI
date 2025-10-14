@@ -4,19 +4,22 @@ import cv2
 import numpy as np
 import json
 from mistralai import Mistral
-from api_keys import mistral_api_key
-from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify, send_file
 from werkzeug.utils import secure_filename
 from PIL import Image
 import pytesseract
 import re
+import io
 
 app = Flask(__name__)
 UPLOAD_FOLDER = "uploads"
+OUTPUT_FOLDER = "outputs"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+load_dotenv()
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-client = Mistral(api_key=mistral_api_key)
+client = Mistral(api_key=os.getenv("mistral_api_key"))
 
 
 def preprocess_page(page):
@@ -28,24 +31,27 @@ def preprocess_page(page):
 
 
 def clean_json_output(raw_output):
-    if not raw_output: return {}
+    if not raw_output:
+        return {}
 
-    raw_output = re.sub(r"^```[a-zA-Z]*\n?|```$", "", raw_output.strip()) # Remove code fences
-    raw_output = raw_output.strip().replace('\\"', '').replace('\n', ' ').replace('\r', ' ') # Remove leading/trailing whitespace & Replace escaped quotes and newlines
-
+    raw_output = re.sub(r"^```[a-zA-Z]*\n?|```$", "", raw_output.strip())
+    raw_output = raw_output.strip().replace('\\"', '').replace('\n', ' ').replace('\r', ' ')
     try:
         return json.loads(raw_output)
     except json.JSONDecodeError:
-        # As last resort, return raw string
         return {"raw_output": raw_output}
 
 
 @app.route('/invoice2json', methods=['POST'])
 def extract_blocks():
-    if 'file' not in request.files: return jsonify({'error': 'No file provided'}), 400
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
 
     file = request.files['file']
-    if file.filename == '': return jsonify({'error': 'No selected file'}), 400
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+    
+    toSave = bool(request.form.get('save', 'true').lower() == 'true')
 
     filename = secure_filename(file.filename)
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
@@ -53,7 +59,6 @@ def extract_blocks():
 
     ext = os.path.splitext(filename)[1].lower()
     structured_text = {}
-    # full_text_list = []
 
     def process_image_blocks(np_img, page_num):
         data = pytesseract.image_to_data(cv2.cvtColor(np_img, cv2.COLOR_BGR2GRAY), output_type=pytesseract.Output.DICT)
@@ -66,19 +71,16 @@ def extract_blocks():
             left, top, width, height = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
             text = data['text'][i].strip()
 
-            if not text: continue
+            if not text:
+                continue
 
-            # Initialize hierarchy: block -> paragraph -> line
             page_dict.setdefault(f'block_{block_num}', {'coords': [], 'paragraphs': {}})
             block = page_dict[f'block_{block_num}']
-
             block['coords'].append((left, top, width, height))
             block['paragraphs'].setdefault(f'para_{par_num}', {})
             block['paragraphs'][f'para_{par_num}'].setdefault(f'line_{line_num}', [])
             block['paragraphs'][f'para_{par_num}'][f'line_{line_num}'].append(text)
-            # full_text_list.append(text)
 
-        # Prepare structured text (without saving crops)
         for block_key, block in page_dict.items():
             structured_paragraphs = {}
             for para_key, lines in block['paragraphs'].items():
@@ -92,32 +94,23 @@ def extract_blocks():
             doc = fitz.open(filepath)
             for page_num in range(len(doc)):
                 page = doc.load_page(page_num)
-                
-                # Try direct text extraction first (for text-based PDFs)
                 text = page.get_text("text").strip()
-                
+
                 if text:
-                    # ✅ Text-based PDF — no OCR needed
                     structured_text[f"page_{page_num}"] = {"text": text}
-                    # full_text_list.append(text)
                 else:
-                    # 🖼️ Image-based PDF — fallback to OCR
                     np_img = preprocess_page(page)
                     process_image_blocks(np_img, page_num)
-            
             doc.close()
 
         else:
             img = Image.open(filepath).convert("RGB")
             np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
             process_image_blocks(np_img, 0)
+
     finally:
         os.remove(filepath)
 
-    # full_text = "\n".join(full_text_list)
-    # return jsonify({'structured_text': structured_text, 'full_text': full_text})
-
-    # --- Gemini LLM processing ---
     try:
         with open("op_schema.json", "r") as f:
             schema = json.load(f)
@@ -133,38 +126,51 @@ def extract_blocks():
         3. Do NOT add any comments or formatting. 
         4. The JSON must be compact and directly parsable with json.loads() in Python. 
         5. Clean the data: remove typos, extra spaces, newlines, or escape characters where possible. 
-        6. Ensure all keys and values strictly follow the schema. If a value is missing, set it to null (not empty or "").
+        6. Ensure all keys and values strictly follow the schema. If a value is missing, set it to null.
         """
-
-        # llm_input = json.dumps(structured_text, ensure_ascii=False)
 
         response = client.chat.complete(
             model="mistral-small-latest",
             messages=[
-                {
-                    "role": "system",
-                    "content": sys_prompt
-                },
-                {
-                    "role": "user",
-                    "content": f"Invoice Text:\n{json.dumps(structured_text, ensure_ascii=False)}"
-                }
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": f"Invoice Text:\n{json.dumps(structured_text, ensure_ascii=False)}"}
             ]
         )
 
-        # Mistral returns JSON object directly
         llm_output = response.choices[0].message.content
-
-        # Remove Markdown code block if present
         structured_json = clean_json_output(llm_output)
-        print(type(structured_json))
-        json_res = json.dumps(structured_json, indent=2) # Fixing the JSON arrangement
-        # print(json_res)
+        json_res = json.dumps(structured_json, indent=2)
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-    return app.response_class(json_res, mimetype="application/json")
+    if toSave:
+        # --- Save output as JSON file ---
+        output_filename = os.path.splitext(filename)[0] + ".json"
+        output_path = os.path.join(OUTPUT_FOLDER, output_filename)
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(json_res)
+
+        # --- Return both JSON and download link ---
+        # download_url = f"/download/{output_filename}"
+
+        return jsonify({
+            "structured_json": json.loads(json_res),
+            "File Saved At": output_path
+        })
+
+    return jsonify({"structured_json": json.loads(json_res)})
+
+@app.route('/download/<path:filename>', methods=['GET'])
+def download_json(filename):
+    """Allow downloading of generated JSON files."""
+    file_path = os.path.join(OUTPUT_FOLDER, filename)
+    if os.path.exists(file_path):
+        return send_file(file_path, as_attachment=True)
+    else:
+        return jsonify({"error": "File not found"}), 404
+
 
 if __name__ == "__main__":
     app.run(debug=True)
